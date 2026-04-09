@@ -105,7 +105,7 @@ class VisionNodeManager:
                         print(f"[INFO] Target absent for {self.absence_threshold}s. Resetting to Idle.")
                         self.status = "Idle"
                         # Ensure the Face ID module forgets the previous person
-                        # self.face_id.reset_state()
+                        self.face_id.reset_state()
 
             # Global UI Rendering
             cv2.putText(left_frame, f"STATUS: {self.status}", (20, 40), 
