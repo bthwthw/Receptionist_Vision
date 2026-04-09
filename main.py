@@ -1,146 +1,105 @@
 import cv2
-import math
-import numpy as np
-from ultralytics import YOLO
 import time
+
+from modules.tracker import FaceTracker
+from modules.face_id import FaceRecognizer
 
 from MQTT.angle_publisher import AnglePublisher, get_topic
 
-class ReceptionistVision:
-    def __init__(self, model_path, cam_id=0):
-        print("[INFO] Loading OpenVINO Model...")
-        self.model = YOLO(model_path, task='detect')
-
-        # Pinhole Camera Intrinsics
-        self.fx = 265.0075
-        self.cx = 336.0675 
+class VisionNodeManager:
+    def __init__(self):
+        # 1. Khởi tạo Modules
+        self.tracker = FaceTracker()
+        self.face_id = FaceRecognizer()
         
-        # System State
+        # 2. State & Timers
         self.status = "Idle"
-        
-        # Timeout tracking for Absence (Switch to Idle)
-        self.last_seen_time = 0.0
-        self.absence_threshold = 3.0 # Wait 3 seconds of empty frame to reset to Idle
-        
-        # Validation tracking for Presence (Switch to Greeting)
         self.first_seen_time = 0.0
-        self.trigger_delay = 2.0 # Wait 2 continuous seconds before sending MQTT
+        self.last_seen_time = 0.0
+        self.trigger_delay = 2.0 
+        self.absence_threshold = 3.0 
+        self.deadband_threshold = 5.0
         
-        # Camera Setup (ZED2 Side-by-side)
-        self.cap = cv2.VideoCapture(cam_id)
+        # 3. Hardware
+        self.cap = cv2.VideoCapture(0)
         self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 2560)
         self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
         
-        # Hardware Compensation (Parallax Error)
-        # Shift angle by approx -2.5 degrees to compensate for the left lens offset
-        self.left_eye_offset_deg = -2.5 
-        # Deadband threshold to ignore small deviations (e.g., <5 degrees)
-        self.deadband_threshold = 5.0
-        # Minimum height ratio to filter out distant/small detections (tune based on environment)
-        self.height_ratio_threshold = 0.5 
-        self._angle_publisher = None 
+        # 4. MQTT
+        self._angle_publisher = None
+        self.setup_mqtt()
 
-    def get_yaw_angle(self, x_center):
-        """Calculate the horizontal deviation angle and apply parallax compensation."""
-        angle_rad = math.atan((x_center - self.cx) / self.fx)
-        raw_angle_deg = math.degrees(angle_rad)
-        
-        # Apply offset to align with the true center of the robot
-        compensated_angle = raw_angle_deg + self.left_eye_offset_deg
-        return compensated_angle
-
-    def publish_mqtt(self, angle_deg):
-        """Publish the target angle via MQTT."""
+    def setup_mqtt(self):
         try:
-            if self._angle_publisher is None:
-                self._angle_publisher = AnglePublisher()
-            
-            # Keep the signed value for relative rotation
-            target_angle_val = float(round(angle_deg, 3))
-            
-            self._angle_publisher.publish_angle({"angle": target_angle_val})
-            print(f"\n[MQTT] === COMMAND FIRED: Rotate by {target_angle_val} degrees ===")
-            
+            self._angle_publisher = AnglePublisher()
+            self._angle_publisher.topic = get_topic("xoay")
         except Exception as e:
-            print(f"[ERROR] MQTT publish failed: {e}")
+            print(f"[WARN] MQTT setup failed: {e}")
+
+    def publish_rotation(self, angle_deg):
+        if self._angle_publisher is None: return
+        try:
+            target_angle = float(round(angle_deg, 3))
+            self._angle_publisher.publish_angle({"angle": target_angle})
+            print(f"\n[MQTT] === COMMAND FIRED: Rotate by {target_angle} degrees ===")
+        except Exception as e:
+            print(f"[ERROR] Publish failed: {e}")
 
     def run(self):
-        print("[INFO] Vision System Started...")
-        
+        print("[INFO] System Started...")
         while self.cap.isOpened():
             ret, frame = self.cap.read()
             if not ret: break
                 
-            # Extract Left Eye
-            height, width, _ = frame.shape
-            left_frame = frame[:, :width//2]
-            frame_height = left_frame.shape[0]
+            left_frame = frame[:, :frame.shape[1]//2]
+            current_time = time.time()
             
-            # Object Detection
-            results = self.model.predict(source=left_frame, classes=[0], conf=0.5, verbose=False)
+            # Quét người liên tục để cập nhật last_seen_time (chống spam MQTT)
+            target = self.tracker.detect(left_frame)
             
-            valid_targets = []
-            
-            # Parse results
-            for box in results[0].boxes:
-                x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
-                box_height = y2 - y1
-                height_ratio = box_height / frame_height
+            if target:
+                self.last_seen_time = current_time
+                bx1, by1, bx2, by2 = target['box']
                 
-                if height_ratio > self.height_ratio_threshold:
-                    x_center = (x1 + x2) / 2.0
-                    angle = self.get_yaw_angle(x_center)
-                    valid_targets.append({
-                        'box': (int(x1), int(y1), int(x2), int(y2)),
-                        'ratio': height_ratio,
-                        'angle': angle
-                    })
-            
-            # Logic: If a valid target is currently in the frame
-            if valid_targets:
-                self.last_seen_time = time.time() 
-                closest_person = max(valid_targets, key=lambda t: t['ratio'])
-                
-                # State Machine Logic for "Idle" -> "Greeting"
+                # --- ĐIỀU PHỐI THEO STATUS ---
                 if self.status == "Idle":
-                    # Mark the first time we see someone
                     if self.first_seen_time == 0.0:
-                        self.first_seen_time = time.time()
-                        print("[INFO] Target acquired. Validating presence (1s)...")
+                        self.first_seen_time = current_time
+                        print("[INFO] Target acquired. Validating (2s)...")
                         
-                    # Check if 1 second has passed continuously
-                    elif ((time.time() - self.first_seen_time) >= self.trigger_delay) and abs(closest_person['angle']) > self.deadband_threshold:
-                        self.publish_mqtt(closest_person['angle'])
-                        self.status = "Greeting"
-                        self.first_seen_time = 0.0 # Reset validation timer
-                
-                # Visuals
-                bx1, by1, bx2, by2 = closest_person['box']
-                color = (0, 255, 0) if self.status == "Greeting" else (0, 165, 255) # Orange for validation, Green for greeting
-                cv2.rectangle(left_frame, (bx1, by1), (bx2, by2), color, 3)
-                
-                status_text = f"STATUS: {self.status}"
-                if self.status == "Idle" and self.first_seen_time > 0:
-                    status_text += f" (Validating...)"
-                    
-                cv2.putText(left_frame, status_text, (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
-                cv2.putText(left_frame, f"Angle: {closest_person['angle']:.1f} deg", (bx1, by1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+                    elif (current_time - self.first_seen_time) >= self.trigger_delay:
+                        if abs(target['angle']) > self.deadband_threshold:
+                            self.publish_rotation(target['angle'])
+                            self.status = "Greeting"
+                            self.first_seen_time = 0.0
+                            
+                    # UI cho Idle
+                    color = (0, 165, 255) if self.first_seen_time > 0 else (0, 255, 0)
+                    cv2.rectangle(left_frame, (bx1, by1), (bx2, by2), color, 3)
+                    cv2.putText(left_frame, f"Angle: {target['angle']:.1f} deg", (bx1, by1 - 10), 
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+                                
+                elif self.status == "Greeting":
+                    # Kích hoạt module chuyên sâu khi đang nói chuyện
+                    left_frame = self.face_id.process(left_frame, target['box'])
+                    cv2.rectangle(left_frame, (bx1, by1), (bx2, by2), (0, 255, 0), 3)
 
-            # Logic: If NO target is seen
             else:
-                # Reset the validation timer immediately if target is lost before 1 second
+                # Xử lý khi khung hình trống
                 if self.first_seen_time > 0.0:
-                    print("[INFO] Target lost during validation. Timer reset.")
                     self.first_seen_time = 0.0
-                
-                # Check absence timeout to return to Idle
+                    print("[INFO] Target lost during validation. Resetting.")
+                    
                 if self.status == "Greeting":
-                    elapsed_absence = time.time() - self.last_seen_time
-                    if elapsed_absence > self.absence_threshold:
+                    if (current_time - self.last_seen_time) > self.absence_threshold:
                         print(f"[INFO] Target absent for {self.absence_threshold}s. Resetting to Idle.")
                         self.status = "Idle"
 
-            cv2.imshow("Receptionist Robot - Perception Layer", left_frame)
+            # UI Chung
+            cv2.putText(left_frame, f"STATUS: {self.status}", (20, 40), 
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+            cv2.imshow("Receptionist Robot Node", left_frame)
+            
             if cv2.waitKey(1) & 0xFF == ord('q'):
                 break
                 
@@ -148,6 +107,5 @@ class ReceptionistVision:
         cv2.destroyAllWindows()
 
 if __name__ == "__main__":
-    # yolo export model=yolov8n.pt format=openvino
-    vision_module = ReceptionistVision(model_path="yolov8n_openvino_model/")
-    vision_module.run()
+    node = VisionNodeManager()
+    node.run()
