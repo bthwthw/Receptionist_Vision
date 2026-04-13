@@ -1,6 +1,8 @@
 import pyzed.sl as sl
 import cv2
 import numpy as np
+import csv # Thư viện xuất file
+import time
 
 def main():
     zed = sl.Camera()
@@ -37,38 +39,45 @@ def main():
     image = sl.Mat()
     objects = sl.Objects()
 
-    while True:
-        if zed.grab() == sl.ERROR_CODE.SUCCESS:
-            # 1. Lấy ảnh trái để hiển thị
-            zed.retrieve_image(image, sl.VIEW.LEFT)
-            frame = image.get_data() # Chuyển sang numpy để dùng cv2
-            frame = cv2.cvtColor(frame, cv2.COLOR_RGBA2RGB) # ZED mặc định là RGBA
+    with open('tracking_data.csv', mode='w', newline='') as file:
+            writer = csv.writer(file)
+            # Ghi tiêu đề cột
+            writer.writerow(['Timestamp', 'ID', 'X', 'Y', 'Z', 'Distance'])
 
-            # 2. Lấy dữ liệu Object
-            zed.retrieve_objects(objects, obj_runtime_param)
+            while True:
+                if zed.grab() == sl.ERROR_CODE.SUCCESS:
+                    zed.retrieve_image(image, sl.VIEW.LEFT)
+                    frame = image.get_data()
+                    frame = cv2.cvtColor(frame, cv2.COLOR_RGBA2RGB)
 
-            for obj in objects.object_list:
-                # Tọa độ 2D (Pixel)
-                box = obj.bounding_box_2d
-                pt1 = (int(box[0][0]), int(box[0][1]))
-                pt2 = (int(box[2][0]), int(box[2][1]))
+                    zed.retrieve_objects(objects, obj_runtime_param)
 
-                # Tọa độ 3D (Spatial Localization) - THỨ WEBCAM KHÔNG CÓ
-                # position[0]: X (phải/trái), [1]: Y (lên/xuống), [2]: Z (khoảng cách tới camera)
-                pos = obj.position 
-                dist = np.linalg.norm(pos) # Khoảng cách thực tế (Euclidean distance)
+                    for obj in objects.object_list:
+                        # Lấy tọa độ đầy đủ
+                        pos = obj.position
+                        x, y, z_coord = pos[0], pos[1], pos[2]
+                        dist = np.linalg.norm(pos)
+                        timestamp = time.time()
 
-                # Vẽ lên OpenCV
-                cv2.rectangle(frame, pt1, pt2, (0, 255, 0), 2)
-                info = f"ID: {obj.id} | Z: {pos[2]:.2f}m | Dist: {dist:.2f}m"
-                cv2.putText(frame, info, (pt1[0], pt1[1]-10), 
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 2)
+                        # Ghi vào file CSV
+                        writer.writerow([timestamp, obj.id, x, y, z_coord, dist])
 
-            cv2.imshow("ZED 3.4.2 - 3D Tracking", frame)
-            if cv2.waitKey(1) & 0xFF == ord('q'):
-                break
+                        # Vẽ lên màn hình để kiểm tra
+                        pt1 = (int(obj.bounding_box_2d[0][0]), int(obj.bounding_box_2d[0][1]))
+                        pt2 = (int(obj.bounding_box_2d[2][0]), int(obj.bounding_box_2d[2][1]))
+                        cv2.rectangle(frame, pt1, pt2, (0, 255, 0), 2)
+                        
+                        label = f"ID:{obj.id} X:{x:.2f} Y:{y:.2f} Z:{z_coord:.2f}"
+                        cv2.putText(frame, label, (pt1[0], pt1[1]-10), 
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
 
+                    cv2.imshow("ZED 3D Localization", frame)
+                    if cv2.waitKey(1) & 0xFF == ord('q'):
+                        break
+
+    # Đóng mọi thứ
     zed.disable_object_detection()
+    zed.disable_positional_tracking()
     zed.close()
 
 if __name__ == "__main__":
